@@ -1,0 +1,311 @@
+name: Etapa 1 - preparar y comprobar
+
+on:
+  workflow_dispatch:
+
+jobs:
+  preparar:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Git sin conversion de saltos de linea
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Crear los 3 parches (vienen dentro de este archivo)
+        run: |
+          cat > 0001-pantalla-de-error-al-cargar-juego.diff <<'PATCH_EOF'
+          diff -ruN a/frontend/main.cpp b/frontend/main.cpp
+          --- a/frontend/main.cpp	2026-10-07 21:04:15.142982477 +0000
+          +++ b/frontend/main.cpp	2026-10-07 21:04:15.201342578 +0000
+          @@ -497,11 +497,34 @@
+                   const unsigned code = static_cast<unsigned>(loaded);
+                   Ps4::Log("load failed: status %u%s", code,
+                            loaded == Core::SystemResultStatus::ErrorVideoCore ? " (video core: see the RADV lines above)" : "");
+          +        std::string loader_text;
+                   if (code > static_cast<unsigned>(Core::SystemResultStatus::ErrorLoader)) {
+                       const auto loader = static_cast<Loader::ResultStatus>(code - static_cast<unsigned>(Core::SystemResultStatus::ErrorLoader));
+          -            Ps4::Log("loader: %s", Loader::GetResultStatusString(loader).c_str());
+          +            loader_text = Loader::GetResultStatusString(loader);
+          +            Ps4::Log("loader: %s", loader_text.c_str());
+                   }
+                   Ps4::SetPadLight(255, 0, 0);
+          +
+          +        // Say it on screen too: the display is closed after the game menu, and without this the
+          +        // app just vanishes after 5 s with no hint about what went wrong.
+          +        std::vector<std::string> lines;
+          +        lines.push_back("Archivo: " + fs::path{game}.filename().string());
+          +        lines.push_back("Estado: " + std::to_string(code) + (loader_text.empty() ? "" : " - " + loader_text));
+          +        if (!fs::exists(fs::path{Ps4::DataDir} / "keys/prod.keys", ec)) {
+          +            lines.push_back("FALTA keys/prod.keys en /data/edenps4 (claves de TU Switch, con Lockpick_RCM).");
+          +        }
+          +        lines.push_back("Causas comunes:");
+          +        lines.push_back("- Claves viejas: prod.keys debe venir de una Switch con firmware igual o mas nuevo que el juego.");
+          +        lines.push_back("- Falta el firmware: copia los .nca a firmware/ y reinicia.");
+          +        lines.push_back("- Formato no soportado (.nsz/.xcz comprimidos): usa .nsp o .xci sin comprimir.");
+          +        lines.push_back("- Archivo corrupto: copialo por FTP en modo binario.");
+          +        lines.push_back("Mas detalle en /data/edenps4/boot.log");
+          +        if (ShowMessageScreen("No se pudo cargar el juego", lines)) {
+          +            // Stay alive like the end-of-game path does: returning from main is reported as a crash.
+          +            for (;;) {
+          +                std::this_thread::sleep_for(std::chrono::seconds(1));
+          +            }
+          +        }
+                   std::this_thread::sleep_for(std::chrono::seconds(5));
+                   return 2;
+               }
+          diff -ruN a/frontend/menu/rom_menu.cpp b/frontend/menu/rom_menu.cpp
+          --- a/frontend/menu/rom_menu.cpp	2026-10-07 21:04:15.143124618 +0000
+          +++ b/frontend/menu/rom_menu.cpp	2026-10-07 21:04:15.201043634 +0000
+          @@ -149,6 +149,30 @@
+                       Dim, Background);
+           }
+           
+          +/// Splits `text` into pieces of at most `width` characters, preferring to break at spaces.
+          +std::vector<std::string> Wrap(const std::string& text, size_t width) {
+          +    std::vector<std::string> out;
+          +    size_t start = 0;
+          +    while (start < text.size()) {
+          +        size_t end = std::min(start + width, text.size());
+          +        if (end < text.size()) {
+          +            const size_t space = text.find_last_of(' ', end);
+          +            if (space != std::string::npos && space > start) {
+          +                end = space;
+          +            }
+          +        }
+          +        out.push_back(text.substr(start, end - start));
+          +        start = end;
+          +        while (start < text.size() && text[start] == ' ') {
+          +            ++start;
+          +        }
+          +    }
+          +    if (out.empty()) {
+          +        out.emplace_back();
+          +    }
+          +    return out;
+          +}
+          +
+           } // Anonymous namespace
+           
+           int RunRomMenu(const std::vector<std::string>& names, int initial) {
+          @@ -252,3 +276,62 @@
+                        selected + 1, names.size(), unsigned(closed));
+               return selected;
+           }
+          +
+          +bool ShowMessageScreen(const std::string& title, const std::vector<std::string>& lines) {
+          +    off_t phys = 0;
+          +    if (int rc = sceKernelAllocateDirectMemory(0, off_t(sceKernelGetDirectMemorySize()),
+          +                                               TotalBytes, Align, MemoryWcGarlic, &phys);
+          +        rc != 0) {
+          +        Ps4::Log("message screen: direct memory refused (0x%x)", unsigned(rc));
+          +        return false;
+          +    }
+          +    void* memory = nullptr;
+          +    if (int rc = sceKernelMapDirectMemory(&memory, TotalBytes, ProtCpuRwGpuRw, 0, phys, Align);
+          +        rc != 0) {
+          +        Ps4::Log("message screen: mapping failed (0x%x)", unsigned(rc));
+          +        sceKernelReleaseDirectMemory(phys, TotalBytes);
+          +        return false;
+          +    }
+          +    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+          +    if (handle < 0) {
+          +        Ps4::Log("message screen: sceVideoOutOpen failed (0x%x)", unsigned(handle));
+          +        munmap(memory, TotalBytes);
+          +        sceKernelReleaseDirectMemory(phys, TotalBytes);
+          +        return false;
+          +    }
+          +    void* buffers[2] = {memory, static_cast<std::uint8_t*>(memory) + BufferBytes};
+          +    alignas(16) std::uint8_t attribute[64] = {};
+          +    sceVideoOutSetBufferAttribute(attribute, PixelFormatA8R8G8B8Srgb, TilingLinear, 0, Width,
+          +                                  Height, Width);
+          +    sceVideoOutSetFlipRate(handle, 0);
+          +    if (int rc = sceVideoOutRegisterBuffers(handle, 0, buffers, 2, attribute); rc < 0) {
+          +        Ps4::Log("message screen: sceVideoOutRegisterBuffers failed (0x%x)", unsigned(rc));
+          +        sceVideoOutClose(handle);
+          +        munmap(memory, TotalBytes);
+          +        sceKernelReleaseDirectMemory(phys, TotalBytes);
+          +        return false;
+          +    }
+          +
+          +    constexpr int Left = 120;
+          +    constexpr int RowHeight = 50;
+          +    constexpr size_t MaxChars = (Width - 2 * Left) / MenuFont::Width;
+          +    Canvas canvas{static_cast<uint32_t*>(buffers[0])};
+          +    canvas.Fill(0, 0, Width, Height, Background);
+          +    canvas.Print(Left, 90, title, 0xFFFF7B7B, Background, MaxChars);
+          +    canvas.Fill(Left, 150, Width - 2 * Left, 3, Dim);
+          +    int y = 190;
+          +    for (const std::string& line : lines) {
+          +        for (const std::string& piece : Wrap(line, MaxChars)) {
+          +            if (y > Height - 170) {
+          +                break;
+          +            }
+          +            canvas.Print(Left, y, piece, Text, Background, MaxChars);
+          +            y += RowHeight;
+          +        }
+          +    }
+          +    canvas.Fill(Left, Height - 130, Width - 2 * Left, 3, Dim);
+          +    canvas.Print(Left, Height - 100, "Boton PS: cerrar la aplicacion", Dim, Background);
+          +    sceVideoOutSubmitFlip(handle, 0, FlipVsync, 0);
+          +    Ps4::Log("message screen shown: %s", title.c_str());
+          +    return true;
+          +}
+          diff -ruN a/frontend/menu/rom_menu.h b/frontend/menu/rom_menu.h
+          --- a/frontend/menu/rom_menu.h	2026-10-07 21:04:15.143138315 +0000
+          +++ b/frontend/menu/rom_menu.h	2026-10-07 21:04:15.200786036 +0000
+          @@ -9,3 +9,9 @@
+           /// Shows `names` (file names) with `initial` selected: Up/Down move (held: repeat), Cross picks.
+           /// Returns the chosen index, or -1 if the display could not be opened (nothing was shown).
+           int RunRomMenu(const std::vector<std::string>& names, int initial);
+          +
+          +/// Shows a full-screen message (a title and wrapped lines of ASCII text) and leaves it on the
+          +/// display; the caller keeps the process alive until the user closes it with the PS button.
+          +/// Returns false, with nothing shown, if the display could not be opened (e.g. Eden's own
+          +/// presentation already owns it); the reason is then in boot.log.
+          +bool ShowMessageScreen(const std::string& title, const std::vector<std::string>& lines);
+          PATCH_EOF
+          cat > 0002-a2b10-forzar-workaround-de-colores.diff <<'PATCH_EOF'
+          --- a/frontend/main.cpp	2026-10-07 21:18:39.180292324 +0000
+          +++ b/frontend/main.cpp	2026-10-07 21:18:39.216554004 +0000
+          @@ -67,6 +67,10 @@
+           extern int ps4_swizzle_mode; // vk_texture_cache.cpp
+           extern int ps4_rg_mode;      // vk_texture_cache.cpp
+           extern int ps4_a2b10_mode;   // vk_texture_cache.cpp
+          +// Set by the startup self-test, or forced here from settings.txt (a2b10=rt|sample|swap|both).
+          +extern bool ps4_a2b10_rt_use_a2r10;     // vk_texture_cache.cpp
+          +extern bool ps4_a2b10_sample_use_a2r10; // vk_texture_cache.cpp
+          +extern bool ps4_a2b10_sample_swap;      // vk_texture_cache.cpp
+           }
+           
+           namespace {
+          @@ -242,6 +246,11 @@
+           ///   astc=gpu|cpu|async          ASTC texture decoding (default cpu)
+           ///   bgra=auto|on|off            B8G8R8A8 red/blue workaround (default auto: startup self-test)
+           ///   a2b10=auto|off              A2B10G10R10 workaround from the startup self-test (default auto)
+          +///   a2b10=rt|sample|swap|both   force the workaround, skipping the self-test (colour experiments):
+          +///                                 rt     render-target views as A2R10G10B10
+          +///                                 sample sampled views as A2R10G10B10
+          +///                                 swap   sampled views with red/blue swapped in the mapping
+          +///                                 both   rt + sample
+           ///   rg=auto|on|off              R8G8 red/green workaround (default auto: startup self-test)
+           ///   swizzle=test|off            run the component-mapping self-test at startup (default off)
+           ///   dyna_state=0..3             Vulkan extended dynamic state level (default 2)
+          @@ -282,6 +291,12 @@
+                       v.use_reactive_flushing.SetValue(value == "on");
+                   } else if (key == "a2b10" && (value == "auto" || value == "off")) {
+                       Vulkan::ps4_a2b10_mode = value == "auto" ? 0 : 2;
+          +        } else if (key == "a2b10" && (value == "rt" || value == "sample" || value == "swap" || value == "both")) {
+          +            // Forced: the flags the self-test would set, and no self-test (mode 2).
+          +            Vulkan::ps4_a2b10_mode = 2;
+          +            Vulkan::ps4_a2b10_rt_use_a2r10 = value == "rt" || value == "both";
+          +            Vulkan::ps4_a2b10_sample_use_a2r10 = value == "sample" || value == "both";
+          +            Vulkan::ps4_a2b10_sample_swap = value == "swap";
+                   } else if (key == "rg" && (value == "auto" || value == "on" || value == "off")) {
+                       Vulkan::ps4_rg_mode = value == "auto" ? 0 : value == "on" ? 1 : 2;
+                   } else if (key == "swizzle" && (value == "test" || value == "off")) {
+          PATCH_EOF
+          cat > 0003-cpu-accuracy-unsafe-por-defecto.diff <<'PATCH_EOF'
+          --- a/frontend/main.cpp	2026-10-08 04:00:16.560837867 +0000
+          +++ b/frontend/main.cpp	2026-10-08 04:00:16.658497772 +0000
+          @@ -202,7 +202,9 @@
+               auto& v = Settings::values;
+               v.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
+               v.use_multi_core.SetValue(true);
+          -    v.cpu_accuracy.SetValue(Settings::CpuAccuracy::Auto);
+          +    // Test 24: unsafe (inexact NaNs, reduced-precision floating point) is faster on the Jaguar
+          +    // cores; settings.txt cpu_accuracy=auto|accurate goes back.
+          +    v.cpu_accuracy.SetValue(Settings::CpuAccuracy::Unsafe);
+               // Handheld renders at 720p: less GPU work for a GPU that is much smaller than the PS5's.
+               v.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+               v.resolution_setup.SetValue(Settings::ResolutionSetup::Res1X);
+          @@ -245,6 +247,7 @@
+           /// other line is logged as unknown and ignored.
+           ///   astc=gpu|cpu|async          ASTC texture decoding (default cpu)
+           ///   bgra=auto|on|off            B8G8R8A8 red/blue workaround (default auto: startup self-test)
+          +///   cpu_accuracy=unsafe|auto|accurate  dynarmic accuracy (default unsafe: faster floating point)
+           ///   a2b10=auto|off              A2B10G10R10 workaround from the startup self-test (default auto)
+           ///   a2b10=rt|sample|swap|both   force the workaround, skipping the self-test (colour experiments):
+           ///                                 rt     render-target views as A2R10G10B10
+          @@ -285,6 +288,10 @@
+                                                                   : Settings::AstcDecodeMode::CpuAsynchronous);
+                   } else if (key == "bgra" && (value == "auto" || value == "on" || value == "off")) {
+                       Vulkan::ps4_bgra_mode = value == "auto" ? 0 : value == "on" ? 1 : 2;
+          +        } else if (key == "cpu_accuracy" && (value == "unsafe" || value == "auto" || value == "accurate")) {
+          +            v.cpu_accuracy.SetValue(value == "unsafe"   ? Settings::CpuAccuracy::Unsafe
+          +                                    : value == "auto"   ? Settings::CpuAccuracy::Auto
+          +                                                        : Settings::CpuAccuracy::Accurate);
+                   } else if (key == "profile" && (value == "on" || value == "off")) {
+                       Ps4::SetProfiling(value == "on");
+                   } else if (key == "reactive_flushing" && (value == "on" || value == "off")) {
+          @@ -420,7 +427,7 @@
+           int main() {
+               Ps4::OpenBootLog();
+               Ps4::Log("eden-ps4 starting (Eden %s %s)", Common::g_scm_branch, Common::g_scm_desc);
+          -    Ps4::Log("PS4 build: %s; test 22: speed - btver2 build, gpu_accuracy low, no reactive flushing, texture audit off, profiler; defaults CPU ASTC, swizzle test off",
+          +    Ps4::Log("PS4 build: %s; test 24 settings: unsafe CPU accuracy, speed - btver2 build, gpu_accuracy low, no reactive flushing, texture audit off, profiler; defaults CPU ASTC, swizzle test off",
+                        EDEN_PS4_BUILD_ID);
+               Ps4::InstallCrashReporting();
+               Ps4::StartWatchdog();
+          PATCH_EOF
+
+      - name: Aplicar los 3 parches (0001, 0002, 0003)
+        run: |
+          set -e
+          ls -la *.diff
+          for f in 0001-*.diff 0002-*.diff 0003-*.diff; do
+            echo "== $f"
+            git apply --check --ignore-whitespace "$f"
+            git apply --ignore-whitespace "$f"
+          done
+          echo "---- version del frontend ----"
+          grep -n "PS4 build:" frontend/main.cpp
+          grep -n "CpuAccuracy::" frontend/main.cpp | head
+          grep -n "a2b10" frontend/main.cpp | head
+
+      - name: Herramientas que ya trae el runner
+        continue-on-error: true
+        run: |
+          for t in git cmake ninja clang python perl make; do
+            printf '%s: ' "$t"; ($t --version 2>&1 | head -1) || echo "no esta"
+          done
+          ls /c/msys64/usr/bin 2>/dev/null | grep -E '^(make|perl)\.exe$' || echo "make/perl de MSYS2: no encontrados"
+          df -h /c | tail -1
+
+      - name: Ver que archivos ofrece cada descarga
+        continue-on-error: true
+        run: |
+          echo "--- OpenOrbis v0.5.4"
+          gh release view v0.5.4 -R OpenOrbis/OpenOrbis-PS4-Toolchain --json assets -q '.assets[].name'
+          echo "--- orbis-sdk-v1"
+          gh release view orbis-sdk-v1 -R orbis-ports/orbis-porting-kit --json assets -q '.assets[].name'
+          echo "--- LLVM 18.1.8 (solo Windows)"
+          gh release view llvmorg-18.1.8 -R llvm/llvm-project --json assets -q '.assets[].name' | grep -i -E "win" || true
+          echo "--- glslang"
+          gh release list -R KhronosGroup/glslang --limit 5
+          gh release view main-tot -R KhronosGroup/glslang --json assets -q '.assets[].name'
+
+      - name: Descargar SDK de la PS4 y toolchain OpenOrbis
+        continue-on-error: true
+        run: |
+          mkdir -p dl/sdk dl/oo
+          gh release download orbis-sdk-v1 -R orbis-ports/orbis-porting-kit -D dl/sdk
+          gh release download v0.5.4 -R OpenOrbis/OpenOrbis-PS4-Toolchain -D dl/oo
+          ls -la dl/sdk dl/oo
+
+      - name: Comprobar que se puede bajar Eden (el commit que usa el proyecto)
+        continue-on-error: true
+        run: |
+          curl -sIL "https://github.com/eden-emulator/mirror/archive/5f142c7926d0c7fcbbd0ce30794d72f638a43b2a.tar.gz" | grep -i -E "^HTTP|content-length" | tail -4
+
+      - name: Probar LLVM 18.1.8
+        continue-on-error: true
+        run: |
+          choco install llvm --version=18.1.8 -y --allow-downgrade --no-progress
+          "/c/Program Files/LLVM/bin/clang.exe" --version
