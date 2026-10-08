@@ -1,0 +1,133 @@
+name: Etapa 2 - herramientas y rutas
+
+on:
+  workflow_dispatch:
+
+jobs:
+  herramientas:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      T: /c/Users/alejo/soh-ps4/tools
+      R: /c/Users/alejo/eden-ps4
+    steps:
+      - name: Git sin conversion de saltos de linea
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Rutas que esperan los scripts del autor
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\Users\alejo\soh-ps4\tools | Out-Null
+          New-Item -ItemType Junction -Path C:\Users\alejo\eden-ps4 -Target $env:GITHUB_WORKSPACE | Out-Null
+          Get-Item C:\Users\alejo\eden-ps4 | Format-List FullName, LinkType, Target
+
+      - name: LLVM 18.1.8
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install llvm --version=18.1.8 -y --allow-downgrade --no-progress
+          & "C:\Program Files\LLVM\bin\clang.exe" --version
+          New-Item -ItemType Junction -Path C:\Users\alejo\soh-ps4\tools\llvm -Target "C:\Program Files\LLVM" | Out-Null
+
+      - name: CMake y Ninja
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          $cmake = (Get-Command cmake).Source
+          $ninja = (Get-Command ninja).Source
+          Write-Host "cmake: $cmake"
+          Write-Host "ninja: $ninja"
+          & cmake --version | Select-Object -First 1
+          & ninja --version
+          $cmakeRoot = Split-Path (Split-Path $cmake)
+          New-Item -ItemType Junction -Path C:\Users\alejo\soh-ps4\tools\cmake-4.4.3-windows-x86_64 -Target $cmakeRoot | Out-Null
+          New-Item -ItemType Directory -Force C:\Users\alejo\soh-ps4\tools\ninja | Out-Null
+          Copy-Item $ninja C:\Users\alejo\soh-ps4\tools\ninja\ninja.exe
+
+      - name: glslang
+        continue-on-error: true
+        run: |
+          mkdir -p dl/glslang
+          name=$(gh release view main-tot -R KhronosGroup/glslang --json assets -q '.assets[].name' | grep -i windows | grep -i release | head -1)
+          echo "archivo elegido: $name"
+          gh release download main-tot -R KhronosGroup/glslang -p "$name" -D dl/glslang
+          "/c/Program Files/7-Zip/7z.exe" x -y -o"$T/glslang" "dl/glslang/$name" > /dev/null
+          ls "$T/glslang" "$T/glslang/bin"
+          mkdir -p "$R/tools/bin"
+          cp "$T/glslang/bin/glslangValidator.exe" "$R/tools/bin/"
+
+      - name: Toolchain OpenOrbis 0.5.4 y SDK orbis-sdk-v1
+        continue-on-error: true
+        run: |
+          mkdir -p dl/sdk dl/oo
+          gh release download v0.5.4 -R OpenOrbis/OpenOrbis-PS4-Toolchain -D dl/oo
+          gh release download orbis-sdk-v1 -R orbis-ports/orbis-porting-kit -D dl/sdk
+          (cd dl/sdk && sha256sum -c orbis-sdk-v1.tar.gz.sha256 || echo "AVISO: el sha256 no coincide")
+          echo "--- contenido de toolchain-llvm-18.tar.gz (primeras lineas)"
+          tar -tzf dl/oo/toolchain-llvm-18.tar.gz | head -30
+          echo "--- contenido de orbis-sdk-v1.tar.gz (primeras lineas)"
+          tar -tzf dl/sdk/orbis-sdk-v1.tar.gz | head -30
+          mkdir -p "$T/OpenOrbis/OpenOrbis/PS4Toolchain" "$R/sdk-dl/orbis-sdk-v1"
+          tar -xzf dl/oo/toolchain-llvm-18.tar.gz -C "$T/OpenOrbis/OpenOrbis/PS4Toolchain" || echo "AVISO: tar de OpenOrbis termino con errores"
+          tar -xzf dl/sdk/orbis-sdk-v1.tar.gz -C "$R/sdk-dl/orbis-sdk-v1" || echo "AVISO: tar del SDK termino con errores"
+          echo "--- estructura OpenOrbis"
+          find "$T/OpenOrbis/OpenOrbis/PS4Toolchain" -maxdepth 2 | head -40
+          echo "--- estructura SDK"
+          find "$R/sdk-dl/orbis-sdk-v1" -maxdepth 3 -type d | head -40
+          echo "--- binarios de Windows de OpenOrbis"
+          find "$T/OpenOrbis" "$R/sdk-dl" \( -name 'create-fself*' -o -name 'create-gp4*' -o -name 'PkgTool.Core*' \) | head
+
+      - name: llvm-mingw (compilador del equipo para FFmpeg)
+        continue-on-error: true
+        run: |
+          mkdir -p dl/mingw
+          tag=$(gh release list -R mstorsjo/llvm-mingw --limit 1 --json tagName -q '.[0].tagName')
+          asset=$(gh release view "$tag" -R mstorsjo/llvm-mingw --json assets -q '.assets[].name' | grep -i 'ucrt-x86_64.zip' | head -1)
+          echo "version: $tag, archivo: $asset"
+          gh release download "$tag" -R mstorsjo/llvm-mingw -p "$asset" -D dl/mingw
+          "/c/Program Files/7-Zip/7z.exe" x -y -o"$T/llvm-mingw" "dl/mingw/$asset" > /dev/null
+          ls "$T/llvm-mingw"
+
+      - name: make y perl de MSYS2
+        continue-on-error: true
+        run: |
+          /c/msys64/usr/bin/pacman -S --noconfirm --needed make perl
+          /c/msys64/usr/bin/make --version | head -1
+          /c/msys64/usr/bin/perl --version | head -2
+
+      - name: Enlazar make y perl donde los busca env-build.sh
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\tools\msys-perl" | Out-Null
+          New-Item -ItemType Junction -Path "$env:GITHUB_WORKSPACE\tools\usr" -Target C:\msys64\usr | Out-Null
+          New-Item -ItemType Junction -Path "$env:GITHUB_WORKSPACE\tools\msys-perl\usr" -Target C:\msys64\usr | Out-Null
+
+      - name: Resumen - que quedo y que falta
+        if: always()
+        run: |
+          faltan=0
+          comprobar() {
+            if [ -e "$1" ]; then echo "OK      $1"; else echo "FALTA   $1"; faltan=1; fi
+          }
+          comprobar "$T/llvm/bin/clang.exe"
+          comprobar "$T/cmake-4.4.3-windows-x86_64/bin/cmake.exe"
+          comprobar "$T/ninja/ninja.exe"
+          comprobar "$T/glslang/bin/glslangValidator.exe"
+          comprobar "$R/tools/bin/glslangValidator.exe"
+          comprobar "$T/OpenOrbis/OpenOrbis/PS4Toolchain"
+          comprobar "$R/sdk-dl/orbis-sdk-v1/sdk"
+          comprobar "$R/sdk-dl/orbis-sdk-v1/orbis-compat"
+          comprobar "$T/llvm-mingw"
+          comprobar "$R/tools/usr/bin/make.exe"
+          comprobar "$R/tools/msys-perl/usr/bin/perl.exe"
+          echo "--- espacio libre"
+          df -h /c /d 2>/dev/null | tail -3
+          exit $faltan
